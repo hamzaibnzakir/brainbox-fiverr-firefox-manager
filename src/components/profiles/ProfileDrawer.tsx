@@ -23,7 +23,12 @@ export function ProfileDrawer({ profile, open, onOpenChange, onSave, onTestProxy
   useEffect(() => { setForm(profile); setTestState("idle"); setShowPassword(false); }, [profile]);
   if (!form) return null;
   function set<K extends keyof FirefoxProfile>(key: K, value: FirefoxProfile[K]) { setForm(prev => prev ? { ...prev, [key]: value } : prev); }
-  async function testProxy() { setTestState("testing"); try { await onTestProxy(form.id); setTestState("ok"); } catch { setTestState("fail"); } }
+  async function testProxy() {
+    const profileId = form?.id;
+    if (!profileId) return;
+    setTestState("testing");
+    try { await onTestProxy(profileId); setTestState("ok"); } catch { setTestState("fail"); }
+  }
   return <Drawer open={open} onOpenChange={onOpenChange} title={form.accountName} subtitle={`${form.firefoxProfileName} · ${form.countryName}`} footer={<><Button variant="secondary" onClick={() => onOpenChange(false)}>Cancel</Button><Button variant="primary" onClick={() => onSave(form)}>Save changes</Button></>}>
     <div className="flex flex-col gap-5">
       <Input label="Account name" value={form.accountName} onChange={e => set("accountName", e.target.value)} />
