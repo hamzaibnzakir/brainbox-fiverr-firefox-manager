@@ -1,19 +1,46 @@
 {
   "engineOnline": true,
-  "platform": "Ubuntu 26.04",
-  "autostart": true,
-  "profiles": [],
+  "platform": "Windows | Ubuntu / Linux | macOS",
+  "autostart": false,
+  "profiles": [
+    {
+      "id": "p1",
+      "targetWebsite": "https://www.fiverr.com/users/manage_gigs",
+      "useDefaultWebsite": true,
+      "lastRefreshed": "2026-09-08T11:00:00+00:00",
+      "nextRefreshAt": "2026-09-08T11:12:34+00:00"
+    }
+  ],
   "activity": [],
   "discoveredFirefoxProfiles": [],
   "settings": {
     "workspaceName": "Brainbox",
     "firefoxBinary": "/usr/bin/firefox",
-    "launchOnLogin": true,
+    "launchOnLogin": false,
     "launchAllAuto": true,
     "startupDelay": 12,
     "defaultSite": "https://www.fiverr.com/users/manage_gigs",
     "theme": "dark",
     "notifyProxyFail": true,
-    "notifyLaunch": false
+    "notifyLaunch": false,
+    "refreshEnabled": false,
+    "refreshMinMinutes": 5,
+    "refreshMaxMinutes": 15
+  },
+  "endpoints": {
+    "GET /api/snapshot": "Current engine state",
+    "POST /api/start-all": "Launch all configured profiles",
+    "POST /api/stop-all": "Stop all profiles",
+    "POST /api/restart-all": "Restart all profiles",
+    "POST /api/proxy-tester": "Test a proxy without saving it",
+    "POST /api/profiles/:id/launch": "Launch one profile",
+    "POST /api/profiles/:id/stop": "Stop one profile",
+    "POST /api/profiles/:id/refresh": "Refresh every currently opened tab",
+    "POST /api/profiles/:id/test-proxy": "Test one configured proxy",
+    "POST /api/proxies/test-all": "Test all configured proxies",
+    "POST /api/profiles": "Create a profile",
+    "PUT /api/profiles/:id": "Update a profile",
+    "DELETE /api/profiles/:id": "Delete a profile",
+    "PUT /api/settings": "Save global settings"
   }
 }
