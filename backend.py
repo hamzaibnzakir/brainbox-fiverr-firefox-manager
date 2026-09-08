@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-"""Brainbox Firefox Manager local API + browser engine.
-
-Runs only on 127.0.0.1.  The React desktop UI talks to this service.
-The proxy bridge logic is the proven manager implementation, wrapped in a
-small API so the UI can control profiles individually or as a group.
-"""
+"""Brainbox Firefox Manager local API and browser engine."""
 from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import platform
+import random
+import re
 import socket
 import subprocess
+import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import random
-import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +28,7 @@ BASE = Path.home() / "brainbox-browser-manager"
 CONFIG_FILE = BASE / "config.json"
 HOST = "127.0.0.1"
 API_PORT = int(os.environ.get("BRAINBOX_API_PORT", "8765"))
+DEFAULT_SITE = "https://www.fiverr.com/users/manage_gigs"
 
 
 def now_iso() -> str:
@@ -38,9 +37,17 @@ def now_iso() -> str:
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_FILE.exists():
-        return {"website": "https://www.fiverr.com/users/manage_gigs", "startup_delay": 12, "profiles": []}
-    with CONFIG_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        return {"website": DEFAULT_SITE, "startup_delay": 12, "profiles": []}
+    try:
+        with CONFIG_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("Configuration root must be an object")
+        data.setdefault("profiles", [])
+        data.setdefault("website", DEFAULT_SITE)
+        return data
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Could not read configuration: {exc}") from exc
 
 
 def save_config(config: dict[str, Any]) -> None:
@@ -57,22 +64,15 @@ def firefox_roots() -> list[Path]:
         return [Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / "Mozilla/Firefox/Profiles"]
     if system == "Darwin":
         return [Path.home() / "Library/Application Support/Firefox/Profiles"]
-    return [
-        Path.home() / "snap/firefox/common/.mozilla/firefox",
-        Path.home() / ".mozilla/firefox",
-        Path.home() / ".var/app/org.mozilla.firefox/.mozilla/firefox",
-    ]
+    return [Path.home() / "snap/firefox/common/.mozilla/firefox", Path.home() / ".mozilla/firefox", Path.home() / ".var/app/org.mozilla.firefox/.mozilla/firefox"]
 
 
 def firefox_binary(config: dict[str, Any]) -> str:
-    configured = config.get("firefox_binary")
+    configured = str(config.get("firefox_binary") or "")
     if configured and Path(configured).exists():
         return configured
     if platform.system() == "Windows":
-        candidates = [
-            os.environ.get("PROGRAMFILES", "") + r"\\Mozilla Firefox\\firefox.exe",
-            os.environ.get("PROGRAMFILES(X86)", "") + r"\\Mozilla Firefox\\firefox.exe",
-        ]
+        candidates = [os.environ.get("PROGRAMFILES", "") + r"\\Mozilla Firefox\\firefox.exe", os.environ.get("PROGRAMFILES(X86)", "") + r"\\Mozilla Firefox\\firefox.exe"]
     elif platform.system() == "Darwin":
         candidates = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
     else:
@@ -98,8 +98,19 @@ def discover_profiles() -> list[dict[str, Any]]:
                     found.append({"name": p.name, "path": str(p)})
         except OSError:
             continue
-    found.sort(key=lambda x: x["name"].lower())
-    return found
+    return sorted(found, key=lambda x: x["name"].lower())
+
+
+def normalize_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return DEFAULT_SITE
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+        raw = "https://" + raw
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid target website: {raw}")
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.params, parsed.query, parsed.fragment))
 
 
 class Engine:
@@ -115,6 +126,7 @@ class Engine:
         self.next_refresh_at: dict[str, float] = {}
         self.last_refresh_at: dict[str, str] = {}
         self.started_at: dict[str, str] = {}
+        self.failed_profiles: set[str] = set()
         self.events: list[dict[str, Any]] = []
         self.engine_running = False
         self.starting = False
@@ -145,7 +157,7 @@ class Engine:
     def profile_by_id(self, pid: str) -> tuple[int, dict[str, Any]]:
         profiles = self.profiles()
         for i, p in enumerate(profiles):
-            if p.get("id", f"p{p.get('local_port', i + 1)}") == pid:
+            if self._profile_id(i, p) == pid:
                 return i, p
         raise KeyError(pid)
 
@@ -153,15 +165,17 @@ class Engine:
         return str(p.get("id") or f"p{p.get('local_port', index + 1)}")
 
     def _profile_path(self, p: dict[str, Any]) -> Path:
-        roots = firefox_roots()
-        requested = p.get("firefox_profile", "")
-        if Path(requested).is_absolute():
-            return Path(requested)
-        for root in roots:
+        requested = str(p.get("firefox_profile") or "")
+        if not requested:
+            raise ValueError("Firefox profile is not configured")
+        candidate_path = Path(requested)
+        if candidate_path.is_absolute():
+            return candidate_path
+        for root in firefox_roots():
             candidate = root / requested
             if candidate.exists():
                 return candidate
-        return roots[0] / requested
+        return firefox_roots()[0] / requested
 
     async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -181,11 +195,11 @@ class Engine:
                 pass
 
     async def _proxy_connection(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, p: dict[str, Any]) -> None:
+        upstream_writer = None
         try:
-            upstream_reader, upstream_writer = await asyncio.open_connection(p["proxy_host"], int(p["proxy_port"]))
-            request = await client_reader.read(65536)
+            upstream_reader, upstream_writer = await asyncio.open_connection(str(p["proxy_host"]), int(p["proxy_port"]))
+            request = await asyncio.wait_for(client_reader.read(65536), timeout=15)
             if not request:
-                client_writer.close()
                 return
             first_line = request.split(b"\r\n", 1)[0]
             credentials = f'{p.get("username", "")}:{p.get("password", "")}'.encode()
@@ -200,27 +214,32 @@ class Engine:
             upstream_writer.write(request)
             await upstream_writer.drain()
             if first_line.startswith(b"CONNECT "):
-                response = await upstream_reader.read(65536)
+                response = await asyncio.wait_for(upstream_reader.read(65536), timeout=15)
                 client_writer.write(response)
                 await client_writer.drain()
-                if response.startswith(b"HTTP/1.1 200") or response.startswith(b"HTTP/1.0 200"):
+                if response.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200")):
                     await asyncio.gather(self._pipe(client_reader, upstream_writer), self._pipe(upstream_reader, client_writer))
             else:
                 await asyncio.gather(self._pipe(client_reader, upstream_writer), self._pipe(upstream_reader, client_writer))
         except Exception as exc:
-            self._log("error", f"Proxy error: {exc}", p.get("name"))
+            self._log("error", f"Proxy connection error: {exc}", p.get("name"))
         finally:
             try:
                 client_writer.close()
+                await client_writer.wait_closed()
             except Exception:
                 pass
+            if upstream_writer:
+                try:
+                    upstream_writer.close()
+                    await upstream_writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _start_proxy(self, pid: str, p: dict[str, Any]) -> None:
         if pid in self.servers:
             return
-        server = await asyncio.start_server(
-            lambda r, w: self._proxy_connection(r, w, p), HOST, int(p["local_port"])
-        )
+        server = await asyncio.start_server(lambda r, w: self._proxy_connection(r, w, p), HOST, int(p["local_port"]))
         self.servers[pid] = server
         self._log("auth", f"Proxy bridge ready on 127.0.0.1:{p['local_port']}", p.get("name"))
 
@@ -255,13 +274,11 @@ class Engine:
             return False
 
     def _geckodriver_binary(self) -> str:
-        configured = self.config.get("geckodriver_binary")
+        configured = str(self.config.get("geckodriver_binary") or "")
         if configured and Path(configured).exists():
             return configured
-        candidates: list[Path] = []
         exe = "geckodriver.exe" if platform.system() == "Windows" else "geckodriver"
-        candidates.append(BASE / exe)
-        candidates.append(Path(__file__).resolve().parent / exe)
+        candidates = [BASE / exe, Path(__file__).resolve().parent / exe]
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             candidates.append(Path(meipass) / exe)
@@ -270,34 +287,87 @@ class Engine:
                 return str(candidate)
         return exe
 
-    def _webdriver_request(self, pid: str, method: str, suffix: str = "", payload: dict[str, Any] | None = None) -> Any:
+    def _webdriver_request(self, pid: str, method: str, suffix: str = "", payload: dict[str, Any] | None = None, timeout: int = 12) -> Any:
         session = self.webdriver.get(pid)
         if not session:
             raise RuntimeError("Browser automation session is not available")
         url = f"http://127.0.0.1:{session['port']}{suffix}"
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read()
             return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def _current_url(self, pid: str) -> str:
+        session = self.webdriver.get(pid)
+        if not session:
+            return ""
+        result = self._webdriver_request(pid, "GET", f"/session/{session['session']}/url", timeout=5)
+        return str(result.get("value") or "")
+
+    def _target_for_profile(self, p: dict[str, Any]) -> str:
+        use_default = p.get("use_default_website")
+        if use_default is None:
+            use_default = not bool(str(p.get("targetWebsite") or "").strip())
+        raw = self.config.get("website", DEFAULT_SITE) if use_default else p.get("targetWebsite") or self.config.get("website", DEFAULT_SITE)
+        return normalize_url(raw)
+
+    def _navigate_to_target(self, pid: str, p: dict[str, Any]) -> tuple[str, str]:
+        target = self._target_for_profile(p)
+        session = self.webdriver[pid]["session"]
+        last_error = ""
+        for attempt in range(2):
+            try:
+                self._webdriver_request(pid, "POST", f"/session/{session}/url", {"url": target}, timeout=30)
+                time.sleep(0.5)
+                current = self._current_url(pid)
+                if current:
+                    return target, current
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt == 0:
+                    time.sleep(1)
+        if last_error:
+            raise RuntimeError(f"Could not open target website {target}: {last_error}")
+        return target, ""
 
     def _refresh_profile_tabs(self, pid: str, p: dict[str, Any]) -> int:
         if pid not in self.webdriver:
             return 0
+        session = self.webdriver[pid]["session"]
+        refreshed = 0
+        failed = 0
+        original = None
         try:
-            handles = self._webdriver_request(pid, "GET", f"/session/{self.webdriver[pid]['session']}/window/handles")
-            handles = handles.get("value", [])
-            refreshed = 0
+            handles_result = self._webdriver_request(pid, "GET", f"/session/{session}/window/handles", timeout=8)
+            handles = list(handles_result.get("value") or [])
+            if not handles:
+                self.last_refresh_at[pid] = now_iso()
+                return 0
+            try:
+                original = self._webdriver_request(pid, "GET", f"/session/{session}/window", timeout=5).get("value")
+            except Exception:
+                original = None
             for handle in handles:
-                self._webdriver_request(pid, "POST", f"/session/{self.webdriver[pid]['session']}/window", {"handle": handle})
-                self._webdriver_request(pid, "POST", f"/session/{self.webdriver[pid]['session']}/refresh", {})
-                refreshed += 1
+                try:
+                    self._webdriver_request(pid, "POST", f"/session/{session}/window", {"handle": handle}, timeout=5)
+                    self._webdriver_request(pid, "POST", f"/session/{session}/refresh", {}, timeout=30)
+                    refreshed += 1
+                except Exception as exc:
+                    failed += 1
+                    self._log("error", f"Tab refresh failed: {exc}", p.get("name"))
+            if original and original in handles:
+                try:
+                    self._webdriver_request(pid, "POST", f"/session/{session}/window", {"handle": original}, timeout=5)
+                except Exception:
+                    pass
             if refreshed:
                 self.last_refresh_at[pid] = now_iso()
-                self._log("page-load", f"Auto-refreshed {refreshed} tab{'s' if refreshed != 1 else ''}", p.get("name"))
+                suffix = f", {failed} failed" if failed else ""
+                self._log("page-load", f"Auto-refreshed {refreshed} tab{'s' if refreshed != 1 else ''}{suffix}", p.get("name"))
             return refreshed
         except Exception as exc:
-            self._log("error", f"Tab refresh failed: {exc}", p.get("name"))
+            self._log("error", f"Tab refresh monitor failed: {exc}", p.get("name"))
             return 0
 
     def _schedule_next_refresh(self, pid: str) -> None:
@@ -310,14 +380,21 @@ class Engine:
             time.sleep(10)
             try:
                 self.config = load_config()
-                if not bool(self.config.get("refresh_enabled", False)):
+                enabled = bool(self.config.get("refresh_enabled", False))
+                if not enabled:
                     continue
                 now = time.time()
-                for pid, session in list(self.webdriver.items()):
-                    if now >= self.next_refresh_at.get(pid, now + 60):
-                        _, p = self.profile_by_id(pid)
-                        self._refresh_profile_tabs(pid, p)
+                for pid in list(self.webdriver):
+                    if pid not in self.next_refresh_at:
                         self._schedule_next_refresh(pid)
+                    if now >= self.next_refresh_at.get(pid, now + 60):
+                        try:
+                            _, p = self.profile_by_id(pid)
+                            self._refresh_profile_tabs(pid, p)
+                        except Exception as exc:
+                            self._log("error", f"Refresh cycle failed: {exc}")
+                        finally:
+                            self._schedule_next_refresh(pid)
             except Exception as exc:
                 self._log("error", f"Refresh monitor error: {exc}")
 
@@ -339,42 +416,36 @@ class Engine:
             deadline = time.time() + 15
             while time.time() < deadline:
                 try:
-                    req = urllib.request.Request(f"http://127.0.0.1:{driver_port}/status")
-                    with urllib.request.urlopen(req, timeout=1) as response:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{driver_port}/status", timeout=1) as response:
                         if response.status == 200:
                             break
                 except Exception:
                     time.sleep(0.15)
             else:
                 raise RuntimeError("geckodriver did not start")
-            payload = {
-                "capabilities": {
-                    "alwaysMatch": {
-                        "browserName": "firefox",
-                        "moz:firefoxOptions": {
-                            "binary": binary,
-                            "args": ["--profile", str(path)],
-                        },
-                    }
-                }
-            }
-            req = urllib.request.Request(f"http://127.0.0.1:{driver_port}/session", data=json.dumps(payload).encode(), method="POST", headers={"Content-Type":"application/json"})
+            payload = {"capabilities": {"alwaysMatch": {"browserName": "firefox", "moz:firefoxOptions": {"binary": binary, "args": ["--profile", str(path)]}}}}
+            req = urllib.request.Request(f"http://127.0.0.1:{driver_port}/session", data=json.dumps(payload).encode(), method="POST", headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode())
             session_id = result.get("value", {}).get("sessionId") or result.get("sessionId")
             if not session_id:
                 raise RuntimeError(f"geckodriver failed to create session: {result}")
             self.webdriver[pid] = {"port": driver_port, "session": session_id}
-            target = p.get("targetWebsite") or self.config.get("website", "https://www.fiverr.com/users/manage_gigs")
-            self._webdriver_request(pid, "POST", f"/session/{session_id}/url", {"url": target})
+            target, current = self._navigate_to_target(pid, p)
             self.started_at[pid] = now_iso()
+            self.failed_profiles.discard(pid)
             self._schedule_next_refresh(pid)
-            self._log("browser-open", "Firefox profile launched with tab monitoring", p.get("name"))
+            self._log("browser-open", f"Opened target {target}" + (f" · landed {current}" if current and current != target else ""), p.get("name"))
         except Exception:
+            self.webdriver.pop(pid, None)
             try:
-                proc.terminate()
+                if platform.system() == "Windows":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    os.killpg(proc.pid, 15)
             except Exception:
-                pass
+                try: proc.terminate()
+                except Exception: pass
             self.processes.pop(pid, None)
             raise
 
@@ -382,8 +453,7 @@ class Engine:
         session = self.webdriver.get(pid)
         if session:
             try:
-                req = urllib.request.Request(f"http://127.0.0.1:{session['port']}/session/{session['session']}", method="DELETE")
-                urllib.request.urlopen(req, timeout=5).close()
+                urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{session['port']}/session/{session['session']}", method="DELETE"), timeout=5).close()
             except Exception:
                 pass
             self.webdriver.pop(pid, None)
@@ -392,32 +462,38 @@ class Engine:
         if proc:
             try:
                 if platform.system() == "Windows":
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
                 else:
                     os.killpg(proc.pid, 15)
             except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                try: proc.terminate()
+                except Exception: pass
+        self.failed_profiles.discard(pid)
         self._log("stop", "Firefox profile stopped", p.get("name"))
 
     def _submit(self, coro: Any) -> None:
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        fut.result(timeout=20)
+        fut.result(timeout=25)
 
     def start_profile(self, pid: str) -> None:
-        idx, p = self.profile_by_id(pid)
+        _, p = self.profile_by_id(pid)
         with self.lock:
             self.config = load_config()
         if pid in self.processes and self.processes[pid].poll() is None:
             return
         if not self._configure_proxy(p):
+            self.failed_profiles.add(pid)
             raise RuntimeError("Firefox profile could not be configured")
         self._submit(self._start_proxy(pid, p))
         time.sleep(0.15)
-        self._launch_process(pid, p)
-        self.engine_running = True
+        try:
+            self._launch_process(pid, p)
+            self.engine_running = True
+        except Exception:
+            try: self._submit(self._stop_proxy(pid))
+            except Exception: pass
+            self.failed_profiles.add(pid)
+            raise
 
     def stop_profile(self, pid: str) -> None:
         _, p = self.profile_by_id(pid)
@@ -440,8 +516,7 @@ class Engine:
                     self._log("error", f"Launch failed: {exc}", p.get("name"))
                 if i < len(profiles) - 1:
                     delay = max(0, int(self.config.get("startup_delay", 12)))
-                    if delay:
-                        time.sleep(delay)
+                    if delay: time.sleep(delay)
             self._log("launch", "Startup sequence complete")
         finally:
             self.starting = False
@@ -449,10 +524,8 @@ class Engine:
     def stop_all(self) -> None:
         for i, p in enumerate(self.profiles()):
             pid = self._profile_id(i, p)
-            try:
-                self.stop_profile(pid)
-            except Exception as exc:
-                self._log("error", f"Stop failed: {exc}", p.get("name"))
+            try: self.stop_profile(pid)
+            except Exception as exc: self._log("error", f"Stop failed: {exc}", p.get("name"))
         self.engine_running = False
         self._log("stop", "All profiles stopped")
 
@@ -460,30 +533,56 @@ class Engine:
         self.stop_all()
         self.start_all()
 
+    def _proxy_test(self, host: str, port: int, username: str, password: str) -> tuple[str, int]:
+        start = time.perf_counter()
+        user = urllib.parse.quote(username, safe="")
+        pw = urllib.parse.quote(password, safe="")
+        proxy_url = f"http://{user}:{pw}@{host}:{port}"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        request = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "BrainboxFirefoxManager/1.1"})
+        with opener.open(request, timeout=12) as response:
+            ip = response.read().decode().strip()
+        ipaddress.ip_address(ip)
+        return ip, int((time.perf_counter() - start) * 1000)
+
     def test_proxy(self, pid: str) -> dict[str, Any]:
         _, p = self.profile_by_id(pid)
-        start = time.perf_counter()
-        user = urllib.parse.quote(str(p.get("username", "")), safe="")
-        pw = urllib.parse.quote(str(p.get("password", "")), safe="")
-        proxy_url = f"http://{user}:{pw}@{p['proxy_host']}:{int(p['proxy_port'])}"
-        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        opener = urllib.request.build_opener(handler)
-        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "BrainboxFirefoxManager/1.0"})
         try:
-            with opener.open(req, timeout=12) as response:
-                ip = response.read().decode().strip()
-            latency = int((time.perf_counter() - start) * 1000)
-            self._log("auth", f"Proxy test passed • {ip} • {latency} ms", p.get("name"))
-            return {"ok": True, "externalIp": ip, "latencyMs": latency}
+            ip, latency = self._proxy_test(str(p.get("proxy_host", "")), int(p.get("proxy_port", 0)), str(p.get("username", "")), str(p.get("password", "")))
+            status = "slow" if latency >= 2500 else "healthy"
+            self._log("auth", f"Proxy test passed · {ip} · {latency} ms", p.get("name"))
+            return {"ok": True, "externalIp": ip, "latencyMs": latency, "proxyStatus": status}
         except Exception as exc:
             self._log("error", f"Proxy test failed: {exc}", p.get("name"))
-            return {"ok": False, "externalIp": "—", "latencyMs": 0, "error": str(exc)}
+            return {"ok": False, "externalIp": "—", "latencyMs": 0, "proxyStatus": "failed", "error": str(exc)}
+
+    def standalone_proxy_test(self, payload: dict[str, Any]) -> dict[str, Any]:
+        host = str(payload.get("host", "")).strip()
+        port = int(payload.get("port", 0))
+        username = str(payload.get("username", ""))
+        password = str(payload.get("password", ""))
+        if not host or not (1 <= port <= 65535):
+            raise ValueError("Enter a valid proxy host and port")
+        try:
+            ip, latency = self._proxy_test(host, port, username, password)
+            flags: list[str] = []
+            score = 0
+            if latency >= 3000:
+                score += 35; flags.append("High latency")
+            elif latency >= 1500:
+                score += 15; flags.append("Elevated latency")
+            if not username:
+                flags.append("No proxy username supplied")
+            level = "high" if score >= 60 else "medium" if score >= 25 else "low"
+            return {"ok": True, "proxyIp": ip, "externalIp": ip, "latencyMs": latency, "countryCode": "", "httpsTunnel": True, "publicIp": True, "riskScore": score, "riskLevel": level, "flags": flags, "source": "local"}
+        except Exception as exc:
+            return {"ok": False, "proxyIp": "", "externalIp": "—", "latencyMs": 0, "countryCode": "", "httpsTunnel": False, "publicIp": False, "riskScore": 100, "riskLevel": "high", "flags": ["Proxy connection failed"], "source": "local", "error": str(exc)}
 
     def snapshot(self) -> dict[str, Any]:
         self.reload()
         profiles = self.config.get("profiles", [])
         out: list[dict[str, Any]] = []
-        running = set()
+        running: set[str] = set()
         for i, p in enumerate(profiles):
             pid = self._profile_id(i, p)
             proc = self.processes.get(pid)
@@ -491,77 +590,44 @@ class Engine:
                 running.add(pid)
         for i, p in enumerate(profiles):
             pid = self._profile_id(i, p)
-            proxy_ok = p.get("proxy_status", "unknown")
-            out.append({
-                "id": pid,
-                "accountName": p.get("name", f"Profile {i+1}"),
-                "countryCode": p.get("country_code", ""),
-                "countryName": p.get("country_name", ""),
-                "status": "running" if pid in running else ("error" if proxy_ok == "failed" else "stopped"),
-                "proxyHost": p.get("proxy_host", ""),
-                "proxyPort": int(p.get("proxy_port", 0)),
-                "proxyUsername": "••••••••" if p.get("username") else "",
-                "proxyPassword": "",
-                "proxyStatus": proxy_ok if proxy_ok in {"healthy", "slow", "failed"} else "failed",
-                "latencyMs": int(p.get("latency_ms", 0)),
-                "externalIp": p.get("external_ip", "—"),
-                "firefoxProfileName": p.get("firefox_profile", ""),
-                "targetWebsite": p.get("targetWebsite") or self.config.get("website", "https://www.fiverr.com/users/manage_gigs"),
-                "lastLaunched": self.started_at.get(pid, "Unknown"),
-                "lastRefreshed": self.last_refresh_at.get(pid, "Unknown"),
-                "nextRefreshAt": datetime.fromtimestamp(self.next_refresh_at[pid], timezone.utc).isoformat() if pid in self.next_refresh_at else None,
-                "startupDelaySeconds": int(p.get("startup_delay", self.config.get("startup_delay", 12))),
-                "launchOnStartup": bool(p.get("launch_on_startup", True)),
-            })
+            proxy_ok = p.get("proxy_status", "failed")
+            use_default = p.get("use_default_website")
+            if use_default is None:
+                use_default = not bool(str(p.get("targetWebsite") or "").strip())
+            target = self.config.get("website", DEFAULT_SITE) if use_default else p.get("targetWebsite", self.config.get("website", DEFAULT_SITE))
+            try: target = normalize_url(target)
+            except Exception: target = str(target or DEFAULT_SITE)
+            out.append({"id":pid,"accountName":p.get("name",f"Profile {i+1}"),"countryCode":p.get("country_code",""),"countryName":p.get("country_name",""),"status":"running" if pid in running else ("error" if pid in self.failed_profiles else "stopped"),"proxyHost":p.get("proxy_host",""),"proxyPort":int(p.get("proxy_port",0)),"proxyUsername":"••••••••" if p.get("username") else "","proxyPassword":"","proxyStatus":proxy_ok if proxy_ok in {"healthy","slow","failed"} else "failed","latencyMs":int(p.get("latency_ms",0)),"externalIp":p.get("external_ip","—"),"firefoxProfileName":p.get("firefox_profile",""),"targetWebsite":target,"useDefaultWebsite":bool(use_default),"lastLaunched":self.started_at.get(pid,"Unknown"),"lastRefreshed":self.last_refresh_at.get(pid,"Unknown"),"nextRefreshAt":datetime.fromtimestamp(self.next_refresh_at[pid],timezone.utc).isoformat() if pid in self.next_refresh_at else None,"startupDelaySeconds":int(p.get("startup_delay",self.config.get("startup_delay",12))),"launchOnStartup":bool(p.get("launch_on_startup",True))})
         system = platform.system()
         autostart = self.autostart_enabled()
-        return {
-            "engineOnline": True,
-            "platform": "Windows" if system == "Windows" else "Ubuntu / Linux" if system == "Linux" else system,
-            "autostart": autostart,
-            "profiles": out,
-            "activity": list(self.events),
-            "discoveredFirefoxProfiles": [
-                {"id": f"fp{i}", "name": item["name"], "inUse": any(item["name"] == p.get("firefox_profile") for p in profiles)}
-                for i, item in enumerate(discover_profiles())
-            ],
-            "settings": {
-                "workspaceName": self.config.get("workspace_name", "Brainbox"),
-                "firefoxBinary": firefox_binary(self.config),
-                "launchOnLogin": autostart,
-                "launchAllAuto": bool(self.config.get("launch_all_auto", True)),
-                "startupDelay": int(self.config.get("startup_delay", 12)),
-                "defaultSite": self.config.get("website", "https://www.fiverr.com/users/manage_gigs"),
-                "theme": self.config.get("theme", "dark"),
-                "notifyProxyFail": bool(self.config.get("notify_proxy_fail", True)),
-                "notifyLaunch": bool(self.config.get("notify_launch", False)),
-                "refreshEnabled": bool(self.config.get("refresh_enabled", False)),
-                "refreshMinMinutes": max(5, int(self.config.get("refresh_min_minutes", 5))),
-                "refreshMaxMinutes": max(5, int(self.config.get("refresh_max_minutes", 15))),
-            },
-        }
+        return {"engineOnline":True,"platform":"Windows" if system=="Windows" else "Ubuntu / Linux" if system=="Linux" else system,"autostart":autostart,"profiles":out,"activity":list(self.events),"discoveredFirefoxProfiles":[{"id":f"fp{i}","name":item["name"],"inUse":any(item["name"]==p.get("firefox_profile") for p in profiles)} for i,item in enumerate(discover_profiles())],"settings":{"workspaceName":self.config.get("workspace_name","Brainbox"),"firefoxBinary":firefox_binary(self.config),"launchOnLogin":autostart,"launchAllAuto":bool(self.config.get("launch_all_auto",True)),"startupDelay":int(self.config.get("startup_delay",12)),"defaultSite":normalize_url(self.config.get("website",DEFAULT_SITE)),"theme":self.config.get("theme","dark"),"notifyProxyFail":bool(self.config.get("notify_proxy_fail",True)),"notifyLaunch":bool(self.config.get("notify_launch",False)),"refreshEnabled":bool(self.config.get("refresh_enabled",False)),"refreshMinMinutes":max(5,int(self.config.get("refresh_min_minutes",5))),"refreshMaxMinutes":max(5,int(self.config.get("refresh_max_minutes",15)))} }
 
     def autostart_enabled(self) -> bool:
         if platform.system() == "Linux":
-            unit = Path.home() / ".config/systemd/user/brainbox-browser.service"
-            return unit.exists()
+            return (Path.home()/".config/systemd/user/brainbox-browser.service").exists()
         if platform.system() == "Windows":
-            return (Path(os.environ.get("APPDATA", Path.home())) / "Microsoft/Windows/Start Menu/Programs/Startup/BrainboxFirefoxManager.cmd").exists()
+            return (Path(os.environ.get("APPDATA",Path.home()))/"Microsoft/Windows/Start Menu/Programs/Startup/BrainboxFirefoxManager.cmd").exists()
         return False
 
     def set_settings(self, s: dict[str, Any]) -> None:
         self.config = load_config()
-        self.config["workspace_name"] = s.get("workspaceName", "Brainbox")
-        self.config["firefox_binary"] = s.get("firefoxBinary", self.config.get("firefox_binary", ""))
+        website = normalize_url(s.get("defaultSite", self.config.get("website", DEFAULT_SITE)))
+        self.config["workspace_name"] = str(s.get("workspaceName", "Brainbox")).strip() or "Brainbox"
+        self.config["firefox_binary"] = str(s.get("firefoxBinary", self.config.get("firefox_binary", ""))).strip()
         self.config["launch_all_auto"] = bool(s.get("launchAllAuto", True))
         self.config["startup_delay"] = max(0, int(s.get("startupDelay", 12)))
-        self.config["website"] = s.get("defaultSite", self.config.get("website", ""))
+        self.config["website"] = website
         self.config["theme"] = s.get("theme", "dark")
         self.config["notify_proxy_fail"] = bool(s.get("notifyProxyFail", True))
         self.config["notify_launch"] = bool(s.get("notifyLaunch", False))
         self.config["refresh_enabled"] = bool(s.get("refreshEnabled", False))
         self.config["refresh_min_minutes"] = max(5, int(s.get("refreshMinMinutes", 5)))
         self.config["refresh_max_minutes"] = max(self.config["refresh_min_minutes"], int(s.get("refreshMaxMinutes", 15)))
+        if self.config["refresh_enabled"]:
+            for pid in self.webdriver:
+                self._schedule_next_refresh(pid)
+        else:
+            self.next_refresh_at.clear()
         save_config(self.config)
         self._log("system", "Settings saved")
 
@@ -570,48 +636,40 @@ class Engine:
         profiles = self.config.setdefault("profiles", [])
         if pid is None:
             index = len(profiles)
-            new = self._frontend_to_config(payload, index)
-            profiles.append(new)
+            profiles.append(self._frontend_to_config(payload, index))
         else:
             idx, current = self.profile_by_id(pid)
             if duplicate:
                 new = dict(current)
-                new["id"] = None
-                new["name"] = f"{current.get('name', 'Profile')} Copy"
+                new["id"] = f"p{self._next_local_port(profiles)}"
+                new["name"] = f"{current.get('name','Profile')} Copy"
                 new["local_port"] = self._next_local_port(profiles)
+                new["webdriver_port"] = 9510 + int(new["local_port"]) - 9100
                 profiles.insert(idx + 1, new)
             else:
+                if pid in self.processes and self.processes[pid].poll() is None:
+                    raise RuntimeError("Stop the profile before changing its configuration")
                 profiles[idx] = self._frontend_to_config(payload, idx, current)
         save_config(self.config)
         self._log("system", "Profile configuration saved")
 
     def _next_local_port(self, profiles: list[dict[str, Any]]) -> int:
-        used = {int(p.get("local_port", 0)) for p in profiles}
+        used = {int(p.get("local_port",0)) for p in profiles}
         port = 9101
-        while port in used:
-            port += 1
+        while port in used: port += 1
         return port
 
     def _frontend_to_config(self, p: dict[str, Any], index: int, current: dict[str, Any] | None = None) -> dict[str, Any]:
         current = current or {}
-        return {
-            "id": p.get("id") or current.get("id") or f"p{p.get('proxyPort', index + 1)}",
-            "name": p.get("accountName", current.get("name", f"Profile {index + 1}")),
-            "firefox_profile": p.get("firefoxProfileName", current.get("firefox_profile", "")),
-            "local_port": int(p.get("localPort", current.get("local_port", self._next_local_port(self.config.get("profiles", []))))),
-            "proxy_host": p.get("proxyHost", current.get("proxy_host", "")),
-            "proxy_port": int(p.get("proxyPort", current.get("proxy_port", 0))),
-            "username": (current.get("username", "") if str(p.get("proxyUsername", "")).startswith("•") else p.get("proxyUsername", current.get("username", ""))),
-            "password": p.get("proxyPassword") or current.get("password", ""),
-            "country_code": p.get("countryCode", current.get("country_code", "")),
-            "country_name": p.get("countryName", current.get("country_name", "")),
-            "targetWebsite": p.get("targetWebsite", current.get("targetWebsite", self.config.get("website", ""))),
-            "launch_on_startup": bool(p.get("launchOnStartup", current.get("launch_on_startup", True))),
-            "startup_delay": int(p.get("startupDelaySeconds", current.get("startup_delay", self.config.get("startup_delay", 12)))),
-            "proxy_status": current.get("proxy_status", "failed"),
-            "latency_ms": current.get("latency_ms", 0),
-            "external_ip": current.get("external_ip", "—"),
-        }
+        local_port = int(p.get("localPort", current.get("local_port", self._next_local_port(self.config.get("profiles", [])))))
+        target = str(p.get("targetWebsite", current.get("targetWebsite", "")) or "").strip()
+        use_default = bool(p.get("useDefaultWebsite", current.get("use_default_website", not bool(target))))
+        if not use_default and target:
+            target = normalize_url(target)
+        return {"id":p.get("id") or current.get("id") or f"p{local_port}","name":str(p.get("accountName",current.get("name",f"Profile {index+1}"))).strip(),"firefox_profile":str(p.get("firefoxProfileName",current.get("firefox_profile",""))).strip(),"local_port":local_port,"webdriver_port":int(current.get("webdriver_port") or (9510+local_port-9100)),"proxy_host":str(p.get("proxyHost",current.get("proxy_host",""))).strip(),"proxy_port":int(p.get("proxyPort",current.get("proxy_port",0))),"username":current.get("username","") if str(p.get("proxyUsername","")).startswith("•") else str(p.get("proxyUsername",current.get("username",""))),"password":str(p.get("proxyPassword") or current.get("password", "")),"country_code":str(p.get("countryCode",current.get("country_code",""))),"country_name":str(p.get("countryName",current.get("country_name",""))),"targetWebsite":target,"use_default_website":use_default,"launch_on_startup":bool(p.get("launchOnStartup",current.get("launch_on_startup",True))),"startup_delay":max(0,int(p.get("startupDelaySeconds",current.get("startup_delay",self.config.get("startup_delay",12))))),"proxy_status":current.get("proxy_status","failed"),"latency_ms":int(current.get("latency_ms",0)),"external_ip":current.get("external_ip","—")}
+
+    def autostart_placeholder(self) -> None:
+        return None
 
 
 ENGINE = Engine()
@@ -638,13 +696,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
+        if length > 2_000_000:
+            raise ValueError("Request body too large")
+        raw = self.rfile.read(length) or b"{}"
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def do_GET(self) -> None:
-        if self.path == "/api/snapshot":
-            json_response(self, 200, ENGINE.snapshot())
-            return
-        json_response(self, 404, {"error": "Not found"})
+        try:
+            if self.path == "/api/snapshot":
+                json_response(self, 200, ENGINE.snapshot())
+            else:
+                json_response(self, 404, {"error":"Not found"})
+        except Exception as exc:
+            json_response(self, 500, {"error":str(exc)})
 
     def do_POST(self) -> None:
         try:
@@ -655,105 +722,96 @@ class Handler(BaseHTTPRequestHandler):
                 ENGINE.stop_all()
             elif path == "/api/restart-all":
                 threading.Thread(target=ENGINE.restart_all, daemon=True).start()
+            elif path == "/api/proxy-tester":
+                result = ENGINE.standalone_proxy_test(self.read_json())
+                json_response(self, 200, result)
+                return
             elif path == "/api/proxies/test-all":
-                for p in ENGINE.profiles():
+                profiles = ENGINE.profiles()
+                for i, p in enumerate(profiles):
+                    pid = ENGINE._profile_id(i, p)
                     try:
-                        result = ENGINE.test_proxy(ENGINE._profile_id(ENGINE.profiles().index(p), p))
-                        p["proxy_status"] = "healthy" if result["ok"] else "failed"
-                        p["latency_ms"] = result.get("latencyMs", 0)
-                        p["external_ip"] = result.get("externalIp", "—")
+                        result = ENGINE.test_proxy(pid)
+                        p["proxy_status"] = result["proxyStatus"]
+                        p["latency_ms"] = result.get("latencyMs",0)
+                        p["external_ip"] = result.get("externalIp","—")
                     except Exception:
                         pass
                 save_config(ENGINE.config)
             elif path.startswith("/api/profiles/"):
                 parts = path.split("/")
+                if len(parts) < 5:
+                    raise KeyError(path)
                 pid = urllib.parse.unquote(parts[3])
-                action = parts[4] if len(parts) > 4 else ""
+                action = parts[4]
                 if action == "launch": ENGINE.start_profile(pid)
                 elif action == "stop": ENGINE.stop_profile(pid)
                 elif action == "duplicate": ENGINE.mutate_profile(pid, {}, duplicate=True)
                 elif action == "refresh":
                     _, p = ENGINE.profile_by_id(pid)
-                    ENGINE._refresh_profile_tabs(pid, p)
+                    ENGINE._refresh_profile_tabs(pid,p)
                     ENGINE._schedule_next_refresh(pid)
                 elif action == "test-proxy":
                     _, p = ENGINE.profile_by_id(pid)
                     result = ENGINE.test_proxy(pid)
-                    p["proxy_status"] = "healthy" if result["ok"] else "failed"
-                    p["latency_ms"] = result.get("latencyMs", 0)
-                    p["external_ip"] = result.get("externalIp", "—")
+                    p["proxy_status"] = result["proxyStatus"]
+                    p["latency_ms"] = result.get("latencyMs",0)
+                    p["external_ip"] = result.get("externalIp","—")
                     save_config(ENGINE.config)
                 else: raise KeyError(pid)
             elif path == "/api/profiles":
-                ENGINE.mutate_profile(None, ENGINE._read_json if False else self.read_json())
+                ENGINE.mutate_profile(None,self.read_json())
             else:
                 raise KeyError(path)
-            json_response(self, 200, ENGINE.snapshot())
+            json_response(self,200,ENGINE.snapshot())
         except Exception as exc:
-            json_response(self, 400, {"error": str(exc)})
+            json_response(self,400,{"error":str(exc)})
 
     def do_PUT(self) -> None:
         try:
-            path = self.path.rstrip("/")
-            payload = self.read_json()
-            if path == "/api/settings":
-                ENGINE.set_settings(payload)
+            path=self.path.rstrip("/")
+            payload=self.read_json()
+            if path=="/api/settings": ENGINE.set_settings(payload)
             elif path.startswith("/api/profiles/"):
-                pid = urllib.parse.unquote(path.split("/")[3])
-                ENGINE.mutate_profile(pid, payload)
-            else:
-                raise KeyError(path)
-            json_response(self, 200, ENGINE.snapshot())
+                pid=urllib.parse.unquote(path.split("/")[3])
+                ENGINE.mutate_profile(pid,payload)
+            else: raise KeyError(path)
+            json_response(self,200,ENGINE.snapshot())
         except Exception as exc:
-            json_response(self, 400, {"error": str(exc)})
+            json_response(self,400,{"error":str(exc)})
 
     def do_DELETE(self) -> None:
         try:
-            path = self.path.rstrip("/")
-            if not path.startswith("/api/profiles/"):
-                raise KeyError(path)
-            pid = urllib.parse.unquote(path.split("/")[3])
-            try:
-                ENGINE.stop_profile(pid)
-            except Exception:
-                pass
-            ENGINE.config = load_config()
-            idx, _ = ENGINE.profile_by_id(pid)
+            path=self.path.rstrip("/")
+            if not path.startswith("/api/profiles/"): raise KeyError(path)
+            pid=urllib.parse.unquote(path.split("/")[3])
+            try: ENGINE.stop_profile(pid)
+            except Exception: pass
+            ENGINE.config=load_config()
+            idx,_=ENGINE.profile_by_id(pid)
             ENGINE.config["profiles"].pop(idx)
             save_config(ENGINE.config)
-            ENGINE._log("system", "Profile removed")
-            json_response(self, 200, ENGINE.snapshot())
+            ENGINE._log("system","Profile removed")
+            json_response(self,200,ENGINE.snapshot())
         except Exception as exc:
-            json_response(self, 400, {"error": str(exc)})
+            json_response(self,400,{"error":str(exc)})
 
 
 def stop_legacy_linux_service() -> None:
-    """Prevent the pre-desktop systemd engine from occupying the API port."""
-    if platform.system() != "Linux":
-        return
+    if platform.system() != "Linux": return
     try:
-        subprocess.run(
-            ["systemctl", "--user", "stop", "brainbox-browser.service"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-    except Exception:
-        pass
+        subprocess.run(["systemctl","--user","stop","brainbox-browser.service"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+    except Exception: pass
 
 
 def main() -> None:
     stop_legacy_linux_service()
-    server = ThreadingHTTPServer((HOST, API_PORT), Handler)
+    server=ThreadingHTTPServer((HOST,API_PORT),Handler)
     print(f"Brainbox Firefox Manager API listening on http://{HOST}:{API_PORT}/api")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
     finally:
         server.server_close()
         ENGINE.loop.call_soon_threadsafe(ENGINE.loop.stop)
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
