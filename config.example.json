@@ -1,0 +1,9 @@
+{
+  "website": "https://www.fiverr.com/users/manage_gigs",
+  "startup_delay": 12,
+  "profiles": []
+,
+  "refresh_enabled": false,
+  "refresh_min_minutes": 5,
+  "refresh_max_minutes": 15
+}

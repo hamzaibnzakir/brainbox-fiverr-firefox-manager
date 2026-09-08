@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.build-tools/
+build/
+dist/
+*.spec
+src-tauri/target/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+__pycache__/
+*.pyc

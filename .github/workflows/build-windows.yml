@@ -1,0 +1,30 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build installer
+        shell: pwsh
+        run: .\build-windows.ps1
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Brainbox-Firefox-Manager-Windows
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe

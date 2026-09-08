@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Brainbox Firefox Manager",
+  "version": "1.1.0",
+  "identifier": "com.brainbox.firefoxmanager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Brainbox Firefox Manager",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Manage isolated Firefox profiles and authenticated proxies.",
+    "longDescription": "Brainbox Firefox Manager provides a premium desktop control center for isolated Firefox identities, authenticated proxy bridges, startup sequencing and profile automation.",
+    "externalBin": [
+      "binaries/brainbox-engine"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "firefox"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "engineOnline": true,
+  "platform": "Ubuntu 26.04",
+  "autostart": true,
+  "profiles": [],
+  "activity": [],
+  "discoveredFirefoxProfiles": [],
+  "settings": {
+    "workspaceName": "Brainbox",
+    "firefoxBinary": "/usr/bin/firefox",
+    "launchOnLogin": true,
+    "launchAllAuto": true,
+    "startupDelay": 12,
+    "defaultSite": "https://www.fiverr.com/users/manage_gigs",
+    "theme": "dark",
+    "notifyProxyFail": true,
+    "notifyLaunch": false
+  }
+}
