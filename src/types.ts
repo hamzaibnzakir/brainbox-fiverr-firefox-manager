@@ -4,7 +4,7 @@ export type ProfileStatus = "ready" | "running" | "stopped" | "error";
 export interface FirefoxProfile {
   id: string;
   accountName: string;
-  countryCode: string; // ISO-2, lowercase, used for flag emoji lookup
+  countryCode: string;
   countryName: string;
   status: ProfileStatus;
   proxyHost: string;
@@ -16,7 +16,8 @@ export interface FirefoxProfile {
   externalIp: string;
   firefoxProfileName: string;
   targetWebsite: string;
-  lastLaunched: string; // human relative string
+  useDefaultWebsite: boolean;
+  lastLaunched: string;
   lastRefreshed?: string;
   nextRefreshAt?: string | null;
   startupDelaySeconds: number;
