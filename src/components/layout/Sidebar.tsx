@@ -69,7 +69,7 @@ export function Sidebar({
         <div className="flex items-center justify-between">
           <div>
             <p className="text-[12px] font-medium text-text-secondary">Brainbox</p>
-            <p className="text-[11px] text-text-tertiary">Version 1.1</p>
+            <p className="text-[11px] text-text-tertiary">Version 1.1.1</p>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-status-healthy" />
