@@ -1,4 +1,4 @@
-import type { ActivityEvent, DiscoveredFirefoxProfile, FirefoxProfile } from "@/types";
+import type { ActivityEvent, DiscoveredFirefoxProfile, FirefoxProfile, ProxyTestInput, ProxyTestResult } from "@/types";
 
 export interface AppSettings {
   workspaceName: string;
@@ -56,6 +56,7 @@ export const api = {
   duplicateProfile: (id: string) => request<AppSnapshot>(`/profiles/${encodeURIComponent(id)}/duplicate`, { method: "POST" }),
   testProxy: (id: string) => request<AppSnapshot>(`/profiles/${encodeURIComponent(id)}/test-proxy`, { method: "POST" }),
   testAllProxies: () => request<AppSnapshot>("/proxies/test-all", { method: "POST" }),
+  testStandaloneProxy: (proxy: ProxyTestInput) => request<ProxyTestResult>("/proxy-tester", { method: "POST", body: JSON.stringify(proxy) }),
   saveSettings: (settings: AppSettings) => request<AppSnapshot>("/settings", { method: "PUT", body: JSON.stringify(settings) }),
   refreshProfile: (id: string) => request<AppSnapshot>(`/profiles/${encodeURIComponent(id)}/refresh`, { method: "POST" }),
 };
