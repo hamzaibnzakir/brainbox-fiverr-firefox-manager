@@ -20,7 +20,7 @@ curl -fL "https://github.com/sapics/ip-location-db/releases/download/latest/user
 python3 -m venv .sidecar-venv
 source .sidecar-venv/bin/activate
 python -m pip install --upgrade pip pyinstaller
-pyinstaller --noconfirm --clean --onefile --add-binary ".build-tools/geckodriver:." --add-data ".build-tools/geo/user-country-ipv4-num.csv:data" --name brainbox-engine desktop_backend.py
+pyinstaller --noconfirm --clean --onefile --add-binary ".build-tools/geckodriver:." --add-data ".build-tools/geo/user-country-ipv4-num.csv:data" --name brainbox-engine desktop_entry.py
 TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 mkdir -p src-tauri/binaries
 cp "dist/brainbox-engine" "src-tauri/binaries/brainbox-engine-${TRIPLE}"
