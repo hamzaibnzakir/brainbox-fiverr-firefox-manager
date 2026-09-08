@@ -5,6 +5,7 @@ const TITLES: Record<Route, string> = {
   dashboard: "Dashboard",
   profiles: "Browser Profiles",
   proxy: "Proxy Manager",
+  "proxy-tester": "Proxy Tester",
   activity: "Activity",
   settings: "Settings",
 };
