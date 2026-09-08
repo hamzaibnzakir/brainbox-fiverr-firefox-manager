@@ -17,6 +17,7 @@ const ICONS: Record<ActivityKind, typeof Play> = {
   "page-load": FileCheck2,
   stop: Square,
   error: AlertTriangle,
+  system: AlertTriangle,
 };
 
 const TONE: Record<ActivityKind, string> = {
@@ -26,6 +27,7 @@ const TONE: Record<ActivityKind, string> = {
   "page-load": "text-status-healthy bg-status-healthy/10",
   stop: "text-text-tertiary bg-white/5",
   error: "text-status-failed bg-status-failed/10",
+  system: "text-text-tertiary bg-white/5",
 };
 
 export function ActivityPage() {
