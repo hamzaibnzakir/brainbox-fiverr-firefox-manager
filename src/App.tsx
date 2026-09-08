@@ -5,6 +5,7 @@ import { BottomBar } from "@/components/layout/BottomBar";
 import { Dashboard } from "@/components/dashboard/Dashboard";
 import { ProfilesPage } from "@/components/profiles/ProfilesPage";
 import { ProxyManager } from "@/components/proxy/ProxyManager";
+import { ProxyTester } from "@/components/proxy/ProxyTester";
 import { ActivityPage } from "@/components/activity/ActivityPage";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { TooltipProvider } from "@/components/ui/Tooltip";
@@ -22,6 +23,7 @@ function Shell() {
           {route === "dashboard" && <Dashboard />}
           {route === "profiles" && <ProfilesPage />}
           {route === "proxy" && <ProxyManager />}
+          {route === "proxy-tester" && <ProxyTester />}
           {route === "activity" && <ActivityPage />}
           {route === "settings" && <SettingsPage />}
         </main>
