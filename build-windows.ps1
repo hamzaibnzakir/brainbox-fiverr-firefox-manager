@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 # Generate the Windows application icon before Tauri starts.
-# Tauri requires src-tauri/icons/icon.ico when building a Windows installer.
 $IconDir = "src-tauri\icons"
 $IconPath = Join-Path $IconDir "icon.ico"
 New-Item -ItemType Directory -Force -Path $IconDir | Out-Null
