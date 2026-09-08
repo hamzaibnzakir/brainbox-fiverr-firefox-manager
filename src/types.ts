@@ -23,6 +23,28 @@ export interface FirefoxProfile {
   launchOnStartup: boolean;
 }
 
+export interface ProxyTestInput {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}
+
+export interface ProxyTestResult {
+  ok: boolean;
+  proxyIp: string;
+  externalIp: string;
+  latencyMs: number;
+  countryCode: string;
+  httpsTunnel: boolean;
+  publicIp: boolean;
+  riskScore: number;
+  riskLevel: "low" | "medium" | "high";
+  flags: string[];
+  source: "local";
+  error?: string;
+}
+
 export type ActivityKind =
   | "launch"
   | "auth"
