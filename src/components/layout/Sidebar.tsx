@@ -2,17 +2,19 @@ import {
   LayoutGrid,
   Users,
   Waypoints,
+  Radar,
   Activity as ActivityIcon,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 
-export type Route = "dashboard" | "profiles" | "proxy" | "activity" | "settings";
+export type Route = "dashboard" | "profiles" | "proxy" | "proxy-tester" | "activity" | "settings";
 
 const NAV: { id: Route; label: string; icon: typeof LayoutGrid }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutGrid },
   { id: "profiles", label: "Profiles", icon: Users },
   { id: "proxy", label: "Proxy Manager", icon: Waypoints },
+  { id: "proxy-tester", label: "Proxy Tester", icon: Radar },
   { id: "activity", label: "Activity", icon: ActivityIcon },
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
@@ -67,7 +69,7 @@ export function Sidebar({
         <div className="flex items-center justify-between">
           <div>
             <p className="text-[12px] font-medium text-text-secondary">Brainbox</p>
-            <p className="text-[11px] text-text-tertiary">Version 1.0</p>
+            <p className="text-[11px] text-text-tertiary">Version 1.1</p>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-status-healthy" />
